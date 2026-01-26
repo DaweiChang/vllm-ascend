@@ -262,6 +262,7 @@ class XliteWrapper:
 
     def __init__(self, runnable: nn.Module, vllm_config: VllmConfig):
         self.runnable = runnable
+        self.vllm_config = vllm_config
         self.full_mode = get_ascend_config().xlite_graph_config.full_mode
 
         rank = torch.distributed.get_rank()
@@ -354,6 +355,16 @@ class XliteWrapper:
             ).tolist()
 
             h = self.hidden_states[:attn_metadata.num_actual_tokens]
+            if self.vllm_config.parallel_config.data_parallel_size > 1:
+                target_length = forward_context.dp_metadata.max_tokens_across_dp_cpu.item()
+                current_length = attn_metadata.num_actual_tokens
+                if target_length > current_length:
+                    pad_length = target_length - current_length
+                    pad_shape = (pad_length, ) + h.shape[1:]
+                    pad_tensor = torch.zeros(pad_shape,
+                                             device=h.device,
+                                             dtype=h.dtype)
+                    h = torch.cat([h, pad_tensor], dim=0)
             stream = torch.npu.current_stream().npu_stream
             if inputs_embeds is None:
                 self.xlite_model.forward(self.xlite_rt, input_ids,
@@ -363,7 +374,7 @@ class XliteWrapper:
                 self.xlite_model.forward_with_inputs_embeds(
                     self.xlite_rt, inputs_embeds, xlite_attn_metadata,
                     self.kv_caches, self.freq_cis, h, stream)
-            return h
+            return h[:attn_metadata.num_actual_tokens]
         else:
             return self.runnable(input_ids, positions, intermediate_tensors,
                                  inputs_embeds)
